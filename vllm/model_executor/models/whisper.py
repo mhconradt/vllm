@@ -809,8 +809,6 @@ class WhisperForConditionalGeneration(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
 
         model_params_dict = dict(self.model.named_parameters())
-        top_params_dict = dict(self.named_parameters())
-
         weights_tuple_list = list(weights)
         for name, loaded_weight in weights_tuple_list:
             name = self._rename_key(name)
