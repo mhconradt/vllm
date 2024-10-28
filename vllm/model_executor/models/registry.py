@@ -87,6 +87,8 @@ _TEXT_GENERATION_MODELS = {
     # [Encoder-decoder]
     "BartModel": ("bart", "BartForConditionalGeneration"),
     "BartForConditionalGeneration": ("bart", "BartForConditionalGeneration"),
+    "WhisperModel": ("whisper", "WhisperForConditionalGeneration"),
+    "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),
     "Florence2ForConditionalGeneration": ("florence2", "Florence2ForConditionalGeneration"),  # noqa: E501
 }
 
@@ -113,8 +115,10 @@ _MULTIMODAL_MODELS = {
     "InternVLChatModel": ("internvl", "InternVLChatModel"),
     "LlavaForConditionalGeneration": ("llava", "LlavaForConditionalGeneration"),
     "LlavaNextForConditionalGeneration": ("llava_next", "LlavaNextForConditionalGeneration"),  # noqa: E501
-    "LlavaNextVideoForConditionalGeneration": ("llava_next_video", "LlavaNextVideoForConditionalGeneration"),  # noqa: E501
-    "LlavaOnevisionForConditionalGeneration": ("llava_onevision", "LlavaOnevisionForConditionalGeneration"),  # noqa: E501
+    "LlavaNextVideoForConditionalGeneration": ("llava_next_video", "LlavaNextVideoForConditionalGeneration"),
+    # noqa: E501
+    "LlavaOnevisionForConditionalGeneration": ("llava_onevision", "LlavaOnevisionForConditionalGeneration"),
+    # noqa: E501
     "MiniCPMV": ("minicpmv", "MiniCPMV"),
     "MolmoForCausalLM": ("molmo", "MolmoForCausalLM"),
     "NVLM_D": ("nvlm_d", "NVLM_D_Model"),
@@ -127,6 +131,7 @@ _MULTIMODAL_MODELS = {
     "UltravoxModel": ("ultravox", "UltravoxModel"),
     # [Encoder-decoder]
     "MllamaForConditionalGeneration": ("mllama", "MllamaForConditionalGeneration"),  # noqa: E501
+    "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),
 }
 
 _SPECULATIVE_DECODING_MODELS = {
@@ -154,18 +159,18 @@ _ROCM_SWA_REASON = ("Sliding window attention (SWA) is not yet supported in "
                     "`VLLM_USE_TRITON_FLASH_ATTN=0`")
 _ROCM_PARTIALLY_SUPPORTED_MODELS: Dict[str, str] = {
     "Qwen2ForCausalLM":
-    _ROCM_SWA_REASON,
+        _ROCM_SWA_REASON,
     "MistralForCausalLM":
-    _ROCM_SWA_REASON,
+        _ROCM_SWA_REASON,
     "MixtralForCausalLM":
-    _ROCM_SWA_REASON,
+        _ROCM_SWA_REASON,
     "PaliGemmaForConditionalGeneration":
-    ("ROCm flash attention does not yet "
-     "fully support 32-bit precision on PaliGemma"),
+        ("ROCm flash attention does not yet "
+         "fully support 32-bit precision on PaliGemma"),
     "Phi3VForCausalLM":
-    ("ROCm Triton flash attention may run into compilation errors due to "
-     "excessive use of shared memory. If this happens, disable Triton FA "
-     "by setting `VLLM_USE_TRITON_FLASH_ATTN=0`")
+        ("ROCm Triton flash attention may run into compilation errors due to "
+         "excessive use of shared memory. If this happens, disable Triton FA "
+         "by setting `VLLM_USE_TRITON_FLASH_ATTN=0`")
 }
 
 
@@ -244,8 +249,8 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
 
 @lru_cache(maxsize=128)
 def _try_load_model_cls(
-    model_arch: str,
-    model: _BaseRegisteredModel,
+        model_arch: str,
+        model: _BaseRegisteredModel,
 ) -> Optional[Type[nn.Module]]:
     if is_hip():
         if model_arch in _ROCM_UNSUPPORTED_MODELS:
@@ -268,8 +273,8 @@ def _try_load_model_cls(
 
 @lru_cache(maxsize=128)
 def _try_inspect_model_cls(
-    model_arch: str,
-    model: _BaseRegisteredModel,
+        model_arch: str,
+        model: _BaseRegisteredModel,
 ) -> Optional[_ModelInfo]:
     try:
         return model.inspect_model_cls()
@@ -288,9 +293,9 @@ class _ModelRegistry:
         return list(self.models.keys())
 
     def register_model(
-        self,
-        model_arch: str,
-        model_cls: Union[Type[nn.Module], str],
+            self,
+            model_arch: str,
+            model_cls: Union[Type[nn.Module], str],
     ) -> None:
         """
         Register an external model to be used in vLLM.
@@ -342,8 +347,8 @@ class _ModelRegistry:
         return _try_inspect_model_cls(model_arch, self.models[model_arch])
 
     def _normalize_archs(
-        self,
-        architectures: Union[str, List[str]],
+            self,
+            architectures: Union[str, List[str]],
     ) -> List[str]:
         if isinstance(architectures, str):
             architectures = [architectures]
@@ -353,8 +358,8 @@ class _ModelRegistry:
         return architectures
 
     def inspect_model_cls(
-        self,
-        architectures: Union[str, List[str]],
+            self,
+            architectures: Union[str, List[str]],
     ) -> _ModelInfo:
         architectures = self._normalize_archs(architectures)
 
@@ -366,8 +371,8 @@ class _ModelRegistry:
         return self._raise_for_unsupported(architectures)
 
     def resolve_model_cls(
-        self,
-        architectures: Union[str, List[str]],
+            self,
+            architectures: Union[str, List[str]],
     ) -> Tuple[Type[nn.Module], str]:
         architectures = self._normalize_archs(architectures)
 
@@ -379,35 +384,35 @@ class _ModelRegistry:
         return self._raise_for_unsupported(architectures)
 
     def is_text_generation_model(
-        self,
-        architectures: Union[str, List[str]],
+            self,
+            architectures: Union[str, List[str]],
     ) -> bool:
         return self.inspect_model_cls(architectures).is_text_generation_model
 
     def is_embedding_model(
-        self,
-        architectures: Union[str, List[str]],
+            self,
+            architectures: Union[str, List[str]],
     ) -> bool:
         return self.inspect_model_cls(architectures).is_embedding_model
 
     def is_multimodal_model(
-        self,
-        architectures: Union[str, List[str]],
+            self,
+            architectures: Union[str, List[str]],
     ) -> bool:
         return self.inspect_model_cls(architectures).supports_multimodal
 
     def is_pp_supported_model(
-        self,
-        architectures: Union[str, List[str]],
+            self,
+            architectures: Union[str, List[str]],
     ) -> bool:
         return self.inspect_model_cls(architectures).supports_pp
 
     def model_has_inner_state(self, architectures: Union[str,
-                                                         List[str]]) -> bool:
+    List[str]]) -> bool:
         return self.inspect_model_cls(architectures).has_inner_state
 
     def is_attention_free_model(self, architectures: Union[str,
-                                                           List[str]]) -> bool:
+    List[str]]) -> bool:
         return self.inspect_model_cls(architectures).is_attention_free
 
 
