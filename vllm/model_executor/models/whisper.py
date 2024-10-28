@@ -38,7 +38,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import IntermediateTensors
 
 logger = logging.get_logger(__name__)
 
@@ -345,14 +344,19 @@ class WhisperEncoderLayer(nn.Module):
             config.activation_function,
             quant_config
         )
-        ffn_hidden_size = self.embed_dim
-        ffn_intermediate_size = config.encoder_ffn_dim
         ffn_has_bias = True
-        self.fc1 = nn.Linear(
+        self.fc1 = ColumnParallelLinear(
             self.embed_dim,
-            config.encoder_ffn_dim
+            config.encoder_ffn_dim,
+            bias=ffn_has_bias,
+            quant_config=quant_config,
         )
-        self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
+        self.fc2 = RowParallelLinear(
+            config.encoder_ffn_dim,
+            self.embed_dim,
+            bias=ffn_has_bias,
+            quant_config=quant_config,
+        )
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(
@@ -431,8 +435,18 @@ class WhisperDecoderLayer(nn.Module):
             quant_config=quant_config,
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.fc1 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
-        self.fc2 = nn.Linear(config.decoder_ffn_dim, self.embed_dim)
+        self.fc1 = ColumnParallelLinear(
+            self.embed_dim,
+            config.decoder_ffn_dim,
+            bias=True,
+            quant_config=quant_config,
+        )
+        self.fc2 = RowParallelLinear(
+            config.decoder_ffn_dim,
+            self.embed_dim,
+            bias=True,
+            quant_config=quant_config,
+        )
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(
