@@ -16,16 +16,20 @@
 """PyTorch Whisper model."""
 
 import math
-from typing import Iterable, List, Optional, Tuple
+from array import array
+from typing import Iterable, List, Optional, Tuple, Literal, cast, Union, Mapping
 
+import numpy as np
 import torch
+from numba.cuda.cudadrv.devicearray import lru_cache
 from torch import nn
-from transformers import WhisperConfig
+from transformers import WhisperConfig, WhisperFeatureExtractor
 from transformers.utils import logging
 
 from vllm.attention import Attention, AttentionMetadata, AttentionType
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.inputs import InputContext, INPUT_REGISTRY, EncoderDecoderInputs
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
@@ -37,22 +41,116 @@ from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models import SupportsMultiModal
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.multimodal import MULTIMODAL_REGISTRY, NestedTensors, MultiModalInputs, MultiModalDataDict
+from vllm.sequence import SequenceData, VLLM_TOKEN_ID_ARRAY_TYPE
 
 logger = logging.get_logger(__name__)
 
 
-class WhisperLearnedPositionalEmbedding(VocabParallelEmbedding):
-    def forward(
-            self,
-            positions: torch.Tensor,
-    ) -> torch.Tensor:
-        # Whisper uses learned positional embedding in decoder only
-        # Encoder uses two convolutional layers followed by sinusoidal positional embedding.
-        return super().forward(positions)
+@lru_cache
+def cached_feature_extractor(model_id: str) -> WhisperFeatureExtractor:
+    return WhisperFeatureExtractor.from_pretrained(model_id)
 
 
-class WhisperEncoderAttention(nn.Module):
+def whisper_feature_extractor(ctx: InputContext) -> WhisperFeatureExtractor:
+    return cached_feature_extractor(ctx.model_config.model)
+
+
+def get_whisper_max_audio_tokens(ctx: InputContext):
+    # Maximum input tokens to the encoder.
+    return ctx.get_hf_config(WhisperConfig).max_source_positions
+
+
+# Returns MultiModalInputs that are **spread into WhisperForConditionalGeneration.forward.
+def input_mapper_for_whisper(ctx: InputContext, data: object) -> MultiModalInputs:
+    if not isinstance(data, list):
+        data = [data]
+    if len(data) == 0:
+        # Is this even legal?
+        return MultiModalInputs()
+    audio_features = []
+    for audio_input in data:
+        if not isinstance(audio_input, tuple):
+            raise NotImplementedError(
+                f"Unsupported data type: {type(audio_input)}")
+
+        (audio, sr) = cast(Tuple[np.ndarray, Union[float, int]], audio_input)
+        feature_extractor = whisper_feature_extractor(ctx)
+
+        if sr != feature_extractor.sampling_rate:
+            try:
+                import librosa
+            except ImportError:
+                raise ImportError(
+                    "Please install vllm[audio] for audio support.") from None
+            audio = librosa.resample(audio,
+                                     orig_sr=sr,
+                                     target_sr=feature_extractor.sampling_rate)
+            sr = feature_extractor.sampling_rate
+
+        minimum_audio_length = feature_extractor.n_fft // 2 + 1
+        if len(audio) < minimum_audio_length:
+            # Not enough audio; pad it.
+            audio = np.pad(audio, (0, minimum_audio_length - len(audio)))
+
+        single_audio_features = feature_extractor(
+            audio, sampling_rate=sr, padding="longest",
+            return_tensors="pt")["input_features"]
+
+        # Remove the batch dimension because we're wrapping it in a list.
+        audio_features.append(single_audio_features.squeeze(0))
+
+    return MultiModalInputs({"audio_features": audio_features})
+
+
+def dummy_seq_data_for_whisper(
+        ctx: InputContext,
+        seq_len: int,
+        mm_counts: Mapping[str, int]
+):
+    whisper_hf_config = ctx.get_hf_config(WhisperConfig)
+    seq_len = min(seq_len, whisper_hf_config.max_target_positions)
+    return SequenceData(array(VLLM_TOKEN_ID_ARRAY_TYPE, [0]) * seq_len)
+
+
+def dummy_audio_data_for_whisper(
+        ctx: InputContext,
+) -> MultiModalDataDict:
+    feature_extractor = whisper_feature_extractor(ctx)
+    return {"audio": [(np.array([0.0] * feature_extractor.chunk_length), 1)]}
+
+
+def dummy_data_for_whisper(
+        ctx: InputContext,
+        seq_len: int,
+        mm_counts: Mapping[str, int]
+) -> Tuple[SequenceData, MultiModalDataDict]:
+    sequence_data = dummy_seq_data_for_whisper(ctx, seq_len, mm_counts)
+    audio_mm_data = dummy_audio_data_for_whisper(ctx)
+    return sequence_data, audio_mm_data
+
+
+def input_processor_for_whisper(
+        ctx: InputContext,
+        inputs: EncoderDecoderInputs,
+):
+    # This might not be necessary.
+    # Alternatively, we might need to do stupid defensive stuff like adding <BOS>.
+    if True:
+        return inputs
+    multi_modal_data = inputs.get("encoder_multi_modal_data")
+    if multi_modal_data is None or "audio" not in multi_modal_data:
+        # Raise?
+        return inputs
+    feature_extractor = whisper_feature_extractor(ctx)
+    audios = multi_modal_data["audio"]
+    if not isinstance(audios, list):
+        audios = [audios]
+
+
+class WhisperEncoderAttention(nn.Module, SupportsMultiModal):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
@@ -697,6 +795,11 @@ class WhisperModel(nn.Module):
         return decoder_outputs
 
 
+@MULTIMODAL_REGISTRY.register_input_mapper("audio", input_mapper_for_whisper)
+# This doesn't have a well-defined meaning or at least I don't know what it is.
+@MULTIMODAL_REGISTRY.register_max_multimodal_tokens("audio", get_whisper_max_audio_tokens)
+@INPUT_REGISTRY.register_dummy_data(dummy_data_for_whisper)
+@INPUT_REGISTRY.register_input_processor(input_processor_for_whisper)
 class WhisperForConditionalGeneration(nn.Module):
     base_model_prefix = "model"
 
