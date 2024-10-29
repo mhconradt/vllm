@@ -87,7 +87,8 @@ _TEXT_GENERATION_MODELS = {
     # [Encoder-decoder]
     "BartModel": ("bart", "BartForConditionalGeneration"),
     "BartForConditionalGeneration": ("bart", "BartForConditionalGeneration"),
-    "WhisperModel": ("whisper", "WhisperForConditionalGeneration"),
+    # Leaving this out for now to simplify things.
+    # "WhisperModel": ("whisper", "WhisperForConditionalGeneration"),
     "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),
     "Florence2ForConditionalGeneration": ("florence2", "Florence2ForConditionalGeneration"),  # noqa: E501
 }
