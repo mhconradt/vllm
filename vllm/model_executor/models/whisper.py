@@ -27,7 +27,7 @@ from transformers import WhisperConfig, WhisperFeatureExtractor
 from transformers.utils import logging
 
 from vllm.attention import Attention, AttentionMetadata, AttentionType
-from vllm.config import CacheConfig, LoRAConfig
+from vllm.config import CacheConfig, LoRAConfig, MultiModalConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.inputs import InputContext, INPUT_REGISTRY, EncoderDecoderInputs
 from vllm.model_executor.layers.activation import get_act_fn
@@ -102,7 +102,11 @@ def input_mapper_for_whisper(ctx: InputContext, data: object) -> MultiModalInput
         # Remove the batch dimension because we're wrapping it in a list.
         audio_features.append(single_audio_features.squeeze(0))
 
-    return MultiModalInputs({"audio_features": audio_features})
+    n_audios = len(audio_features)
+    assert n_audios == 1, str(n_audios)
+    audio_features_tensor = torch.stack(audio_features).squeeze(0)
+    print("audio_features", audio_features_tensor.shape)
+    return MultiModalInputs({"audio_features": audio_features_tensor})
 
 
 def dummy_seq_data_for_whisper(
@@ -150,7 +154,7 @@ def input_processor_for_whisper(
         audios = [audios]
 
 
-class WhisperEncoderAttention(nn.Module, SupportsMultiModal):
+class WhisperEncoderAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
@@ -474,6 +478,7 @@ class WhisperEncoderLayer(nn.Module):
         Returns:
             Encoder layer output torch.Tensor
         """
+        print("WhisperEncoderLayer.forward")
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(
@@ -628,7 +633,10 @@ class WhisperEncoder(nn.Module):
 
         self.embed_positions = nn.Embedding(self.max_source_positions, embed_dim)
 
-        self.layers = nn.ModuleList([WhisperEncoderLayer(config) for _ in range(config.encoder_layers)])
+        self.layers = nn.ModuleList([
+            WhisperEncoderLayer(config, cache_config, quant_config)
+            for _ in range(config.encoder_layers)
+        ])
         self.layer_norm = nn.LayerNorm(config.d_model)
 
     def forward(
@@ -692,7 +700,7 @@ class WhisperDecoder(nn.Module):
             quant_config: Optional[QuantizationConfig] = None,
             lora_config: Optional[LoRAConfig] = None,
     ):
-        super().__init__(config)
+        super().__init__()
         self.padding_idx = config.pad_token_id
         self.max_target_positions = config.max_target_positions
         self.max_source_positions = config.max_source_positions
@@ -702,7 +710,9 @@ class WhisperDecoder(nn.Module):
         self.embed_positions = nn.Embedding(self.max_target_positions, config.d_model)
 
         self.layers = nn.ModuleList(
-            [WhisperDecoderLayer(config, layer_idx) for layer_idx in range(config.decoder_layers)]
+            [
+                WhisperDecoderLayer(config, cache_config, quant_config)
+                for _ in range(config.decoder_layers)]
         )
         self.layer_norm = nn.LayerNorm(config.d_model)
 
@@ -769,14 +779,16 @@ class WhisperModel(nn.Module):
     def forward(
             self,
             decoder_input_ids: torch.Tensor,
-            positions: torch.Tensor,
+            decoder_positions: torch.Tensor,
+            encoder_input_ids: torch.Tensor,
             encoder_input_features: torch.Tensor,
             encoder_positions: torch.Tensor,
             kv_caches: List[torch.Tensor],
             attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
+        print("WhisperModel.forward")
         encoder_hidden_states = None
-        if encoder_input_features.numel():
+        if encoder_input_ids.numel():
             encoder_hidden_states = self.encoder(
                 input_features=encoder_input_features,
                 positions=encoder_positions,
@@ -787,7 +799,7 @@ class WhisperModel(nn.Module):
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
             decoder_input_ids=decoder_input_ids,
-            decoder_positions=positions,
+            decoder_positions=decoder_positions,
             encoder_hidden_states=encoder_hidden_states,
             kv_caches=kv_caches,
             attn_metadata=attn_metadata,
@@ -800,18 +812,20 @@ class WhisperModel(nn.Module):
 @MULTIMODAL_REGISTRY.register_max_multimodal_tokens("audio", get_whisper_max_audio_tokens)
 @INPUT_REGISTRY.register_dummy_data(dummy_data_for_whisper)
 @INPUT_REGISTRY.register_input_processor(input_processor_for_whisper)
-class WhisperForConditionalGeneration(nn.Module):
+class WhisperForConditionalGeneration(nn.Module, SupportsMultiModal):
     base_model_prefix = "model"
 
     def __init__(
             self,
             config: WhisperConfig,
+            multimodal_config: MultiModalConfig,
             cache_config: Optional[CacheConfig] = None,
             quant_config: Optional[QuantizationConfig] = None,
             lora_config: Optional[LoRAConfig] = None
     ):
         super().__init__()
         self.config = config
+        self.multimodal_config = multimodal_config
         self.unpadded_vocab_size = config.vocab_size
         if lora_config:
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
@@ -837,18 +851,20 @@ class WhisperForConditionalGeneration(nn.Module):
 
     def forward(
             self,
-            decoder_input_ids: torch.Tensor,
-            decoder_positions: torch.Tensor,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
             kv_caches: List[torch.Tensor],
             attn_metadata: AttentionMetadata,
-            encoder_input_features: torch.Tensor,
+            # Unused.
+            encoder_input_ids: torch.Tensor,
             encoder_positions: torch.Tensor,
+            **kwargs
     ) -> torch.Tensor:
         r"""
         Args:
-            decoder_input_ids
+            input_ids
                 torch.Tensor of *decoder* input token ids.
-            decoder_positions
+            positions
                 torch.Tensor of *decoder* position indices.
             encoder_input_features
                 torch.Tensor of *encoder* input token ids.
@@ -861,9 +877,16 @@ class WhisperForConditionalGeneration(nn.Module):
         Returns:
             Output torch.Tensor
         """
+        print("WhisperForConditionalGeneration.forward")
+        encoder_input_features = kwargs.pop("audio_features")
+        encoder_input_features = encoder_input_features.to(
+            next(self.model.encoder.parameters()).dtype
+        )
+
         outputs = self.model(
-            decoder_input_ids=decoder_input_ids,
-            decoder_positions=decoder_positions,
+            decoder_input_ids=input_ids,
+            decoder_positions=positions,
+            encoder_input_ids=encoder_input_ids,
             encoder_input_features=encoder_input_features,
             encoder_positions=encoder_positions,
             attn_metadata=attn_metadata,

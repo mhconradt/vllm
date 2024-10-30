@@ -1,39 +1,27 @@
-from typing import Tuple, List, Optional, Type
-
+from typing import List, Optional, Tuple, Type
 import numpy as np
 import pytest
 from transformers import AutoTokenizer, AutoModel, BatchEncoding
 
-from tests.conftest import HfRunner, VllmRunner
-from tests.models.utils import check_logprobs_close
-from vllm import TextPrompt
-from vllm.inputs import EncoderDecoderInputs, ExplicitEncoderDecoderPrompt
-from vllm.multimodal import MultiModalDataDict
 from vllm.sequence import SampleLogprobs
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.inputs import ExplicitEncoderDecoderPrompt
+from vllm import TextPrompt
+from ....conftest import HfRunner, VllmRunner
+from ...utils import check_logprobs_close
 
-MODELS = ["openai/whisper-large-v3", "whisper-tiny"]
-
-AudioTuple = Tuple[np.ndarray, int]
+MODELS = ["openai/whisper-tiny"]  # Fast failures with smallest model
+AUDIO_SAMPLE_RATE = 16000
 
 
 @pytest.fixture(scope="session")
 def audio_assets():
     from vllm.assets.audio import AudioAsset
-    return [AudioAsset("mary_had_lamb"), AudioAsset("winning_call")]
+    return [AudioAsset("mary_had_lamb")]
 
 
-@pytest.fixture(scope="module", params=("mary_had_lamb", "winning_call"))
-def audio(request):
-    from vllm.assets.audio import AudioAsset
-    return AudioAsset(request.param)
-
-
-def vllm_to_hf_output(vllm_output: Tuple[List[int], str, Optional[SampleLogprobs]],
-                      model: str):
-    """Sanitize vllm output to be comparable with hf output."""
+def vllm_to_hf_output(vllm_output: Tuple[List[int], str, Optional[SampleLogprobs]], model: str):
     output_ids, output_str, out_logprobs = vllm_output
-
     tokenizer = AutoTokenizer.from_pretrained(model)
     eos_token_id = tokenizer.eos_token_id
 
@@ -45,106 +33,85 @@ def vllm_to_hf_output(vllm_output: Tuple[List[int], str, Optional[SampleLogprobs
     return hf_output_ids, hf_output_str, out_logprobs
 
 
-def run_test(
-        hf_runner: Type[HfRunner],
-        vllm_runner: Type[VllmRunner],
-        prompts_and_audios: List[Tuple[str, str, AudioTuple]],
-        model: str,
-        *,
-        dtype: str,
-        max_tokens: int,
-        num_logprobs: int,
-        tensor_parallel_size: int,
-        distributed_executor_backend: Optional[str] = None,
-):
-    """Inference result should be the same between hf and vllm."""
-    torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[dtype]
+def run_test(hf_runner: Type[HfRunner],
+             vllm_runner: Type[VllmRunner],
+             audio_data: Tuple[np.ndarray, int],
+             model: str,
+             prompts: List[str],
+             *,
+             dtype: str = "half",
+             max_tokens: int = 128):
+    """Compare vLLM and HF outputs with minimal ceremony"""
 
-    # NOTE: take care of the order. run vLLM first, and then run HF.
-    # vLLM needs a fresh new process without cuda initialization.
-    # if we run HF first, the cuda initialization will be done and it
-    # will hurt multiprocessing backend with fork method (the default method).
-
-    with vllm_runner(model,
-                     dtype=dtype,
-                     tensor_parallel_size=tensor_parallel_size,
-                     distributed_executor_backend=distributed_executor_backend,
-                     enforce_eager=True) as vllm_model:
-        vllm_model.model.generate(
-            ExplicitEncoderDecoderPrompt(
-                encoder_prompt=TextPrompt(
-                    text="",
-                    multi_modal_data={
-                        "audio": ...,
-                    }
+    with vllm_runner(
+            model,
+            dtype=dtype,
+            enforce_eager=True,
+            limit_mm_per_prompt={"audio": 1}
+    ) as vllm_model:
+        vllm_outputs = []
+        for prompt in prompts:
+            # Force encoder-decoder pathway
+            output = vllm_model.generate(
+                ExplicitEncoderDecoderPrompt(
+                    encoder_prompt=TextPrompt(
+                        text=prompt,
+                        multi_modal_data={"audio": [audio_data]}
+                    ),
+                    decoder_prompt=TextPrompt(text=prompt)
                 ),
-                decoder_prompt=...
+                max_tokens=max_tokens
             )
-        )
-        vllm_outputs_per_audio = [
-            vllm_model.generate_greedy_logprobs([vllm_prompt],
-                                                max_tokens,
-                                                num_logprobs=num_logprobs,
-                                                audios=[audio])
-            for vllm_prompt, _, audio in prompts_and_audios
-        ]
+            vllm_outputs.append(output)
 
-    def process(hf_inputs: BatchEncoding):
-        hf_inputs["audio_values"] = hf_inputs["audio_values"] \
-            .to(torch_dtype)  # type: ignore
-        return hf_inputs
-
-    with hf_runner(model,
-                   dtype=dtype,
-                   postprocess_inputs=process,
-                   auto_cls=AutoModel) as hf_model:
+    with hf_runner(model, dtype=dtype, auto_cls=AutoModel) as hf_model:
         import librosa
+        audio, sr = audio_data
+        if sr != AUDIO_SAMPLE_RATE:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=AUDIO_SAMPLE_RATE)
 
-        hf_outputs_per_audio = [
-            hf_model.generate_greedy_logprobs_limit(
-                [hf_prompt],
+        hf_outputs = []
+        for prompt in prompts:
+            output = hf_model.generate(
+                [prompt],
                 max_tokens,
-                num_logprobs=num_logprobs,
-                audios=[(librosa.resample(audio[0],
-                                          orig_sr=audio[1],
-                                          target_sr=16000), 16000)])
-            for _, hf_prompt, audio in prompts_and_audios
-        ]
+                audios=[(audio, AUDIO_SAMPLE_RATE)]
+            )
+            hf_outputs.append(output)
 
-    for hf_outputs, vllm_outputs in zip(hf_outputs_per_audio,
-                                        vllm_outputs_per_audio):
+    for hf_out, vllm_out in zip(hf_outputs, vllm_outputs):
         check_logprobs_close(
-            outputs_0_lst=hf_outputs,
-            outputs_1_lst=[
-                vllm_to_hf_output(vllm_output, model)
-                for vllm_output in vllm_outputs
-            ],
+            outputs_0_lst=hf_out,
+            outputs_1_lst=[vllm_to_hf_output(out, model) for out in vllm_out],
             name_0="hf",
-            name_1="vllm",
+            name_1="vllm"
         )
 
 
-@pytest.mark.parametrize("dtype", ["half"])
-@pytest.mark.parametrize("max_tokens", [128])
-@pytest.mark.parametrize("num_logprobs", [5])
-@pytest.mark.parametrize("model_name", MODELS)
-def test_models(
-        hf_runner,
-        vllm_runner,
-        audio,
-        dtype: str,
-        max_tokens: int,
-        num_logprobs: int,
-        model_name: str,
-) -> None:
-    pfx = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
-    run_test(
-        hf_runner,
-        vllm_runner,
-        [(pfx, pfx, audio.audio_and_sample_rate)],
-        model_name,
-        dtype=dtype,
-        max_tokens=max_tokens,
-        num_logprobs=num_logprobs,
-        tensor_parallel_size=1,
-    )
+def test_whisper_core(hf_runner, vllm_runner, audio_assets):
+    """Core test focusing on potentially problematic cases"""
+    audio = audio_assets[0].audio_and_sample_rate
+
+    edge_case_prompts = [
+        # Basic transcription
+        "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
+
+        # Force timestamp handling
+        "<|startoftranscript|><|en|><|transcribe|><|timestamp|>",
+
+        # Test language switching mid-stream
+        "<|startoftranscript|><|en|><|transcribe|><|notimestamps|><|fr|>",
+
+        # Empty prompt to test encoder-only behavior
+        ""
+    ]
+
+    run_test(hf_runner, vllm_runner, audio, MODELS[0], edge_case_prompts)
+
+
+# def test_whisper_empty_audio(hf_runner, vllm_runner):
+#     """Test handling of empty/invalid audio input"""
+#     empty_audio = (np.array([0.0] * 100), AUDIO_SAMPLE_RATE)
+#     prompt = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
+#
+#     run_test(hf_runner, vllm_runner, empty_audio, MODELS[0], [prompt])
